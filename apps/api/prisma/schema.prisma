@@ -1,0 +1,418 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  TEAM
+}
+enum EventStatus {
+  DRAFT
+  READY
+  LIVE
+  PAUSED
+  ENDED
+}
+enum AuctionKind {
+  POWER_CARD
+  PROBLEM
+}
+enum PowerCardEffect {
+  NONE
+  TIME_EXTENSION
+  CREDIT_GRANT
+  SCORE_BONUS
+}
+enum AuctionStatus {
+  DRAFT
+  SCHEDULED
+  OPEN
+  CLOSED
+}
+enum ItemStatus {
+  AVAILABLE
+  ACTIVE
+  SOLD
+  CLOSED
+}
+enum ProblemStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  SOLVED
+  TIME_EXPIRED
+}
+enum SubmissionKind {
+  RUN
+  SUBMIT
+}
+enum SubmissionStatus {
+  QUEUED
+  RUNNING
+  ACCEPTED
+  PARTIAL
+  WRONG_ANSWER
+  COMPILE_ERROR
+  RUNTIME_ERROR
+  TIME_LIMIT
+  MEMORY_LIMIT
+  INTERNAL_ERROR
+}
+enum LeaderboardVisibility {
+  HIDDEN
+  PUBLIC
+  FINAL
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique @db.VarChar(254)
+  passwordHash String
+  role         Role     @default(TEAM)
+  active       Boolean  @default(true)
+  teamId       String?
+  teamSlot     Int?
+  team         Team?    @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  sessions     Session[]
+  auditLogs    AuditLog[]
+  scoreAdjustments ScoreAdjustment[] @relation("ScoreAdjustmentActor")
+  cardActivations PowerCardActivation[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([teamId, teamSlot])
+  @@index([teamId])
+}
+
+model Team {
+  id         String   @id @default(cuid())
+  teamCode   String   @unique @db.VarChar(32)
+  name       String   @db.VarChar(100)
+  active     Boolean  @default(true)
+  credits    Int      @default(1000)
+  reservedCredits Int @default(0)
+  revision   Int      @default(0)
+  startedAt  DateTime?
+  users      User[]
+  bids       Bid[]
+  cards      TeamCard[]
+  problems   TeamProblem[]
+  sessions   CodingSession[]
+  submissions Submission[]
+  scoreAdjustments ScoreAdjustment[]
+  notifications Notification[]
+  leadingItems AuctionItem[] @relation("AuctionItemLeader")
+  score      Score?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([userId, expiresAt])
+}
+
+model Event {
+  id                    String @id @default(cuid())
+  name                  String @default("Algorithm Auction")
+  status                EventStatus @default(DRAFT)
+  codingRoundOpen       Boolean @default(false)
+  pausedAt              DateTime?
+  leaderboardVisibility LeaderboardVisibility @default(HIDDEN)
+  publicRevision        Int @default(0)
+  scoreResetAt          DateTime?
+  creditBonusAwardedAt  DateTime?
+  displayCardId         String? @unique
+  displayProblemId      String? @unique
+  displayCard           PowerCard? @relation("EventDisplayedPowerCard", fields: [displayCardId], references: [id], onDelete: SetNull)
+  displayProblem        Problem? @relation("EventDisplayedProblem", fields: [displayProblemId], references: [id], onDelete: SetNull)
+  settings              EventSettings?
+  auctions              Auction[]
+  cards                 PowerCard[]
+  problems              Problem[]
+  auditLogs             AuditLog[]
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model EventSettings {
+  id                    String @id @default(cuid())
+  eventId               String @unique
+  event                 Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  startingCredits       Int @default(1000)
+  creditBonusRate       Decimal @default(0.1) @db.Decimal(6, 4)
+  creditBonusRounding   String @default("FLOOR")
+  timingPointsMax       Int @default(0)
+  partialCreditEnabled  Boolean @default(true)
+  maxSourceBytes        Int @default(50000)
+  updatedAt             DateTime @updatedAt
+}
+
+model PowerCard {
+  id               String @id @default(cuid())
+  eventId          String
+  event            Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name             String @db.VarChar(100)
+  description      String @db.Text
+  imageData        String? @db.Text
+  benefits         Json
+  conditions       String? @db.Text
+  usageLimit       Int?
+  effectType       PowerCardEffect @default(NONE)
+  effectValue      Int @default(0)
+  startingBid      Int @default(0)
+  published        Boolean @default(false)
+  version          Int @default(1)
+  supersedesId     String? @unique
+  supersedes       PowerCard? @relation("PowerCardVersions", fields: [supersedesId], references: [id], onDelete: Restrict)
+  successor        PowerCard? @relation("PowerCardVersions")
+  auctionItems     AuctionItem[]
+  assignments      TeamCard[]
+  displayedByEvent Event? @relation("EventDisplayedPowerCard")
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  @@index([eventId, published])
+}
+
+model Problem {
+  id                String @id @default(cuid())
+  eventId           String
+  event             Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  problemCode       String @db.VarChar(32)
+  title             String @db.VarChar(150)
+  difficulty        String @db.VarChar(24)
+  statement         String @db.Text
+  inputFormat       String @db.Text
+  outputFormat      String @db.Text
+  constraints       String @db.Text
+  sampleExamples    Json
+  startingBid       Int @default(0)
+  maxBid            Int?
+  timeLimitSeconds  Int @default(1200)
+  maxScore          Int @default(100)
+  maxTimingPoints   Int @default(0)
+  published         Boolean @default(false)
+  version           Int @default(1)
+  supersedesId      String? @unique
+  supersedes        Problem? @relation("ProblemVersions", fields: [supersedesId], references: [id], onDelete: Restrict)
+  successor         Problem? @relation("ProblemVersions")
+  testCases         TestCase[]
+  auctionItems      AuctionItem[]
+  assignments       TeamProblem[]
+  displayedByEvent  Event? @relation("EventDisplayedProblem")
+  codingSessions    CodingSession[]
+  submissions       Submission[]
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  @@unique([eventId, problemCode, version])
+  @@index([eventId, problemCode])
+  @@index([eventId, published])
+}
+
+model TestCase {
+  id            String @id @default(cuid())
+  problemId     String
+  problem       Problem @relation(fields: [problemId], references: [id], onDelete: Cascade)
+  input         String @db.Text
+  expected      String @db.Text
+  weight        Int @default(1)
+  isSample      Boolean @default(false)
+  position      Int
+  results       TestCaseResult[]
+  @@index([problemId, isSample, position])
+}
+
+model Auction {
+  id         String @id @default(cuid())
+  eventId    String
+  event      Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  kind       AuctionKind
+  status     AuctionStatus @default(DRAFT)
+  startsAt   DateTime?
+  endsAt     DateTime?
+  items      AuctionItem[]
+  createdAt  DateTime @default(now())
+  @@index([eventId, status])
+}
+
+model AuctionItem {
+  id           String @id @default(cuid())
+  auctionId    String
+  auction      Auction @relation(fields: [auctionId], references: [id], onDelete: Cascade)
+  cardId       String?
+  card         PowerCard? @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  problemId    String?
+  problem      Problem? @relation(fields: [problemId], references: [id], onDelete: Restrict)
+  status       ItemStatus @default(AVAILABLE)
+  currentBid   Int @default(0)
+  highestTeamId String?
+  highestTeam   Team? @relation("AuctionItemLeader", fields: [highestTeamId], references: [id], onDelete: Restrict)
+  closesAt     DateTime?
+  revision     Int @default(0)
+  bids         Bid[]
+  @@index([auctionId, status])
+}
+
+model Bid {
+  id            String @id @default(cuid())
+  auctionItemId String
+  auctionItem   AuctionItem @relation(fields: [auctionItemId], references: [id], onDelete: Restrict)
+  teamId        String
+  team          Team @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  amount        Int
+  idempotencyKey String @unique
+  createdAt     DateTime @default(now())
+  @@index([auctionItemId, createdAt])
+  @@index([teamId, createdAt])
+}
+
+model TeamCard {
+  id         String @id @default(cuid())
+  teamId     String
+  team       Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  cardId     String
+  card       PowerCard @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  activatedAt DateTime?
+  usesRemaining Int?
+  activations   PowerCardActivation[]
+  @@unique([teamId, cardId])
+}
+
+model PowerCardActivation {
+  id              String @id @default(cuid())
+  teamCardId      String
+  teamCard        TeamCard @relation(fields: [teamCardId], references: [id], onDelete: Restrict)
+  actorId         String
+  actor           User @relation(fields: [actorId], references: [id], onDelete: Restrict)
+  problemId       String?
+  idempotencyKey  String @unique
+  effectType      PowerCardEffect
+  effectValue     Int
+  createdAt       DateTime @default(now())
+  @@index([teamCardId, createdAt])
+}
+
+model TeamProblem {
+  id         String @id @default(cuid())
+  teamId     String
+  team       Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  problemId  String
+  problem    Problem @relation(fields: [problemId], references: [id], onDelete: Restrict)
+  status     ProblemStatus @default(NOT_STARTED)
+  unassignedAt DateTime?
+  @@unique([teamId, problemId])
+}
+
+model CodingSession {
+  id           String @id @default(cuid())
+  teamId       String
+  team         Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  problemId    String
+  problem      Problem @relation(fields: [problemId], references: [id], onDelete: Restrict)
+  startedAt    DateTime @default(now())
+  deadlineAt   DateTime
+  endedAt      DateTime?
+  violationCount Int @default(0)
+  savedCode      String @default("") @db.Text
+  collabState    String? @db.Text
+  language       String @default("PYTHON") @db.VarChar(16)
+  revision       Int @default(0)
+  @@unique([teamId, problemId])
+  @@index([teamId, deadlineAt])
+}
+
+model Submission {
+  id             String @id @default(cuid())
+  teamId         String
+  team           Team @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  problemId      String
+  problem        Problem @relation(fields: [problemId], references: [id], onDelete: Restrict)
+  kind           SubmissionKind
+  language       String @db.VarChar(16)
+  source         String @db.Text
+  customInput    String? @db.Text
+  runOutput      String? @db.Text
+  runError       String? @db.Text
+  compileOutput  String? @db.Text
+  status         SubmissionStatus @default(QUEUED)
+  workerLeaseUntil DateTime?
+  score          Int @default(0)
+  executionMs    Int?
+  idempotencyKey String @unique
+  createdAt      DateTime @default(now())
+  results        TestCaseResult[]
+  @@index([teamId, problemId, createdAt])
+}
+
+model TestCaseResult {
+  id           String @id @default(cuid())
+  submissionId String
+  submission   Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  testCaseId   String
+  testCase     TestCase @relation(fields: [testCaseId], references: [id], onDelete: Restrict)
+  passed       Boolean
+  awardedScore Int
+  executionMs  Int?
+  @@unique([submissionId, testCaseId])
+}
+
+model Score {
+  teamId       String @id
+  team         Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  solution     Int @default(0)
+  timing       Float @default(0)
+  creditBonus  Int @default(0)
+  adjustments  Int @default(0)
+  total        Float @default(0)
+  revision     Int @default(0)
+  updatedAt    DateTime @updatedAt
+}
+
+model ScoreAdjustment {
+  id          String @id @default(cuid())
+  teamId      String
+  team        Team @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  actorId     String
+  actor       User @relation("ScoreAdjustmentActor", fields: [actorId], references: [id], onDelete: Restrict)
+  oldValue    Int
+  newValue    Int
+  reason      String @db.VarChar(500)
+  createdAt   DateTime @default(now())
+  @@index([teamId, createdAt])
+}
+
+model AuditLog {
+  id         String @id @default(cuid())
+  eventId    String?
+  event      Event? @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  actorId    String?
+  actor      User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action     String @db.VarChar(100)
+  targetType String @db.VarChar(80)
+  targetId   String?
+  details    Json
+  requestId  String?
+  createdAt  DateTime @default(now())
+  @@index([eventId, createdAt])
+  @@index([actorId, createdAt])
+}
+
+model Notification {
+  id        String @id @default(cuid())
+  teamId    String?
+  team      Team? @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  kind      String @db.VarChar(80)
+  payload   Json
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+  @@index([teamId, createdAt])
+}

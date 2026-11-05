@@ -1,0 +1,15 @@
+node_modules/
+.next/
+dist/
+.env
+.env.*
+!.env.example
+credentials.seed.json
+Algorithm_Auction_Credentials*.xlsx
+*.xlsx.inspect.ndjson
+coverage/
+
+# Local Judge0 database and API secrets
+infra/judge0/judge0.conf
+
+*.tsbuildinfo
