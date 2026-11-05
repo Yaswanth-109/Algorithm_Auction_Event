@@ -1,0 +1,18 @@
+{
+  "name": "algorithm-auction",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/api", "apps/web", "packages/shared"],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:services": "concurrently -n api,web -c blue,green \"npm run dev -w @algorithm-auction/api\" \"npm run dev -w @algorithm-auction/web\"",
+    "build": "npm run build -w @algorithm-auction/shared && npm run build -w @algorithm-auction/api && npm run build -w @algorithm-auction/web",
+    "test": "npm run test -w @algorithm-auction/api",
+    "db:generate": "npm run db:generate -w @algorithm-auction/api",
+    "db:migrate": "npm run db:migrate -w @algorithm-auction/api",
+    "accounts:provision": "npm run accounts:provision -w @algorithm-auction/api",
+    "runner:build": "docker build -t algorithm-auction-runner:local -f infra/runner/Dockerfile infra/runner"
+  },
+  "devDependencies": {"concurrently": "^9.1.2", "typescript": "^5.8.3"},
+  "overrides": {}
+}
