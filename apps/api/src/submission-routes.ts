@@ -78,8 +78,11 @@ export function createSubmissionRouters(prisma: PrismaClient) {
       const submission = await prisma.submission.findFirst({ where: { id: req.params.submissionId, teamId: req.auth.teamId }, select: safeSubmission });
       if (!submission) return res.status(404).json({ error: "Submission not found" });
       if (submission.kind === "SUBMIT") {
-        const results = await prisma.testCaseResult.findMany({ where: { submissionId: submission.id }, select: { passed: true, awardedScore: true, executionMs: true } });
-        res.json({ submission: { ...submission, runOutput: null, runError: null, compileOutput: null }, results: { attempted: results.length, passed: results.filter((row) => row.passed).length, score: results.reduce((sum, row) => sum + row.awardedScore, 0) } });
+        const [results, total] = await Promise.all([
+          prisma.testCaseResult.findMany({ where: { submissionId: submission.id }, select: { passed: true, awardedScore: true, executionMs: true } }),
+          prisma.testCase.count({ where: { problemId: submission.problemId, isSample: false } }),
+        ]);
+        res.json({ submission: { ...submission, runOutput: null, runError: null, compileOutput: null }, results: { attempted: results.length, passed: results.filter((row) => row.passed).length, total, score: results.reduce((sum, row) => sum + row.awardedScore, 0) } });
       } else res.json({ submission });
     } catch (error) { next(error); }
   });

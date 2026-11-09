@@ -4,7 +4,7 @@ import type { PrismaClient } from "./generated/prisma/client.js";
 
 type TeamSocketUser = { id: string; role: string; teamId: string | null };
 type CodingDocument = { doc: Y.Doc; text: Y.Text; revision: number; persistChain: Promise<void> };
-type Ack = (result: { ok: boolean; error?: string }) => void;
+type Ack = (result: { ok: boolean; error?: string; starterUpdated?: boolean }) => void;
 
 const documents = new Map<string, Promise<CodingDocument>>();
 const templates: Record<string, string> = {
@@ -14,6 +14,7 @@ const templates: Record<string, string> = {
   CPP: "#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n    // Write your solution here\n    return 0;\n}\n",
 };
 const room = (sessionId: string) => `coding:${sessionId}`;
+const isStarterCode = (source: string) => source.length === 0 || Object.values(templates).includes(source);
 
 function asUpdate(value: unknown): Uint8Array | null {
   if (value instanceof Uint8Array) return value;
@@ -28,12 +29,24 @@ export function createCodingCollaboration(io: Server, prisma: PrismaClient) {
     if (!session) throw new Error("Coding session not found");
     const doc = new Y.Doc();
     const text = doc.getText("source");
-    if (session.collabState) Y.applyUpdate(doc, Buffer.from(session.collabState, "base64"));
-    else {
+    let persistInitialDocument = false;
+    if (session.collabState) {
+      Y.applyUpdate(doc, Buffer.from(session.collabState, "base64"));
+      // Older sessions can contain an encoded but empty Y.Doc. Recover the
+      // saved source, or the selected language's starter, before joining.
+      if (text.length === 0) {
+        const initialCode = session.savedCode || templates[session.language] || templates.PYTHON;
+        if (initialCode) text.insert(0, initialCode);
+        persistInitialDocument = true;
+      }
+    } else {
       const initialCode = session.savedCode || templates[session.language] || templates.PYTHON;
       if (initialCode) text.insert(0, initialCode);
+      persistInitialDocument = true;
+    }
+    if (persistInitialDocument) {
       const collabState = Buffer.from(Y.encodeStateAsUpdate(doc)).toString("base64");
-      await prisma.codingSession.update({ where: { id: sessionId }, data: { savedCode: initialCode, collabState } });
+      await prisma.codingSession.update({ where: { id: sessionId }, data: { savedCode: text.toString(), collabState } });
     }
 
     const state: CodingDocument = { doc, text, revision: session.revision, persistChain: Promise.resolve() };
@@ -124,11 +137,30 @@ export function createCodingCollaboration(io: Server, prisma: PrismaClient) {
       const language = payload?.language;
       if (typeof sessionId !== "string" || !joined.has(sessionId) || typeof language !== "string" || !Object.hasOwn(templates, language)) return ack?.({ ok: false, error: "Invalid language change" });
       try {
+        const activeSession = await prisma.codingSession.findFirst({ where: { id: sessionId, teamId, endedAt: null, deadlineAt: { gt: new Date() } }, select: { id: true } });
+        if (!activeSession) return ack?.({ ok: false, error: "This coding session has expired" });
+        const state = await getDocument(sessionId);
+        let starterUpdated = false;
+        if (isStarterCode(state.text.toString())) {
+          state.doc.transact(() => {
+            // Recheck inside the transaction so a teammate's new code is never overwritten.
+            if (!isStarterCode(state.text.toString())) return;
+            const currentLength = state.text.length;
+            if (currentLength > 0) state.text.delete(0, currentLength);
+            state.text.insert(0, templates[language]);
+            starterUpdated = true;
+          }, socket.id);
+          if (starterUpdated) await state.persistChain;
+        }
         const saved = await prisma.codingSession.updateMany({ where: { id: sessionId, teamId, endedAt: null, deadlineAt: { gt: new Date() } }, data: { language, revision: { increment: 1 } } });
         if (saved.count !== 1) return ack?.({ ok: false, error: "This coding session has expired" });
         const current = await prisma.codingSession.findUnique({ where: { id: sessionId }, select: { revision: true } });
+        // The document update normally excludes its author to avoid echoing
+        // every keystroke. Language changes are server-authored, so send the
+        // starter template back to the member who requested the change.
+        if (starterUpdated) socket.emit("coding:update", { sessionId, update: Y.encodeStateAsUpdate(state.doc) });
         io.to(room(sessionId)).emit("coding:language.updated", { sessionId, language, revision: current?.revision ?? 0 });
-        ack?.({ ok: true });
+        ack?.({ ok: true, starterUpdated });
       } catch (error) {
         console.error("coding_language_update_failed", { sessionId, error });
         ack?.({ ok: false, error: "Could not save the team language" });

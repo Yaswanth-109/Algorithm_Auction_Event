@@ -23,7 +23,7 @@ const CaseInput = z.object({ input: z.string().max(100000), expected: z.string()
 const ProblemInput = z.object({
   problemCode: z.string().trim().min(1).max(32).regex(/^[A-Za-z0-9_-]+$/), title: z.string().trim().min(1).max(150),
   difficulty: z.enum(["EASY", "MEDIUM", "HARD", "EXPERT"]), statement: z.string().min(1).max(50000),
-  inputFormat: z.string().min(1).max(10000), outputFormat: z.string().min(1).max(10000), constraints: z.string().min(1).max(10000),
+  inputFormat: z.string().min(1).max(10000), outputFormat: z.string().min(1).max(10000), constraints: z.string().max(10000).default(""),
   sampleExamples: z.array(z.object({ input: z.string().max(100000), output: z.string().max(100000), explanation: z.string().max(10000).optional() }).strict()).max(20),
   startingBid: z.number().int().nonnegative(), maxBid: z.number().int().nonnegative().nullable().optional(),
   timeLimitSeconds: z.number().int().min(60).max(86400), maxScore: z.number().int().positive(), maxTimingPoints: z.number().int().nonnegative().default(0),
@@ -198,21 +198,25 @@ export function createAdminRouter(prisma: PrismaClient, io: Server, codingCollab
       const event = await getEvent();
       const result = await prisma.$transaction(async (tx) => {
         const currentEvent = await tx.event.findUniqueOrThrow({ where: { id: event.id } });
-        if (currentEvent.codingRoundOpen) throw Object.assign(new Error("Close the coding round before resetting the scoreboard"), { status: 409 });
-        const runningSubmissions = await tx.submission.count({ where: { status: "RUNNING" } });
-        if (runningSubmissions > 0) throw Object.assign(new Error("Wait for running code evaluations to finish before resetting the scoreboard"), { status: 409 });
+        const pendingSubmissions = await tx.submission.count({ where: { status: { in: ["QUEUED", "RUNNING"] } } });
+        if (pendingSubmissions > 0) throw Object.assign(new Error("Wait for queued and running code evaluations to finish before resetting the scoreboard"), { status: 409 });
         const resetAt = new Date();
         const [teams, scores, adjustments] = await Promise.all([
           tx.team.count(),
           tx.score.updateMany({ data: { solution: 0, timing: 0, creditBonus: 0, adjustments: 0, total: 0, revision: { increment: 1 } } }),
           tx.scoreAdjustment.deleteMany(),
         ]);
-        await tx.event.update({ where: { id: event.id }, data: { scoreResetAt: resetAt, publicRevision: { increment: 1 } } });
+        // A scoreboard reset also clears the one-time credit bonus award
+        // marker, so opening the coding round again can calculate a fresh
+        // bonus from the teams' current remaining credits.
+        const updatedEvent = await tx.event.update({ where: { id: event.id }, data: { codingRoundOpen: false, scoreResetAt: resetAt, creditBonusAwardedAt: null, publicRevision: { increment: 1 } }, select: { publicRevision: true } });
         await tx.auditLog.create({ data: { eventId: event.id, actorId: req.auth!.id, action: "scoreboard.reset", targetType: "Event", targetId: event.id, details: { resetAt: resetAt.toISOString(), teams, scoresReset: scores.count, scoreHistoryCleared: adjustments.count } } });
-        return { resetAt, teams, scoresReset: scores.count, scoreHistoryCleared: adjustments.count };
+        return { resetAt, teams, scoresReset: scores.count, scoreHistoryCleared: adjustments.count, publicRevision: updatedEvent.publicRevision };
       }, { isolationLevel: "Serializable" });
-      io.to("event:admin").emit("leaderboard.updated", { revision: Date.now() });
-      io.to("event:teams").emit("leaderboard.updated", { revision: Date.now() });
+      io.to("event:admin").emit("event.updated", { eventId: event.id, revision: result.publicRevision });
+      io.to("event:teams").emit("event.updated", { eventId: event.id, revision: result.publicRevision });
+      io.to("event:admin").emit("leaderboard.updated", { revision: result.publicRevision });
+      io.to("event:teams").emit("leaderboard.updated", { revision: result.publicRevision });
       res.json({ reset: true, ...result });
     } catch (error) {
       if (error && typeof error === "object" && "status" in error) return res.status(Number((error as { status: number }).status)).json({ error: (error as { message?: string }).message ?? "Scoreboard reset rejected" });
@@ -851,7 +855,13 @@ export function createAdminRouter(prisma: PrismaClient, io: Server, codingCollab
         const now = new Date();
         const currentEvent = await tx.event.findUniqueOrThrow({ where: { id: event.id } });
         let creditBonusAwardedAt = currentEvent.creditBonusAwardedAt;
-        if (input.data.codingRoundOpen === true && !currentEvent.creditBonusAwardedAt) {
+        // Opening the round is the admin's explicit bonus-calculation action.
+        // Recalculate on every open request so corrected physical-auction
+        // credits (or a prior scoreboard reset) cannot leave stale bonus data.
+        // The score field is replaced, not incremented, so repeated requests
+        // never award the same credits twice.
+        let creditBonusSummary: { teamCount: number; totalBonus: number } | null = null;
+        if (input.data.codingRoundOpen === true) {
           const reservedTeams = await tx.team.count({ where: { active: true, reservedCredits: { gt: 0 } } });
           if (reservedTeams > 0) throw Object.assign(new Error("Settle or cancel outstanding online bids before opening the coding round"), { status: 409 });
           const [teams, settings] = await Promise.all([
@@ -860,20 +870,25 @@ export function createAdminRouter(prisma: PrismaClient, io: Server, codingCollab
           ]);
           const rate = Number(settings?.creditBonusRate ?? 0.1);
           const rounding = (settings?.creditBonusRounding ?? "FLOOR") as "FLOOR" | "CEIL" | "ROUND";
-          for (const team of teams) {
-            const score = await tx.score.findUnique({ where: { teamId: team.id } });
-            const creditBonus = calculateCreditBonus(team.credits, team.reservedCredits, rate, rounding);
+          const bonuses = teams.map((team) => ({
+            teamId: team.id,
+            remainingCredits: Math.max(0, team.credits - team.reservedCredits),
+            bonus: calculateCreditBonus(team.credits, team.reservedCredits, rate, rounding),
+          }));
+          for (const { teamId, bonus: creditBonus } of bonuses) {
+            const score = await tx.score.findUnique({ where: { teamId } });
             const solution = score?.solution ?? 0;
             const timing = score?.timing ?? 0;
             const adjustments = score?.adjustments ?? 0;
             await tx.score.upsert({
-              where: { teamId: team.id },
-              create: { teamId: team.id, solution, timing, creditBonus, adjustments, total: solution + timing + creditBonus + adjustments },
+              where: { teamId },
+              create: { teamId, solution, timing, creditBonus, adjustments, total: solution + timing + creditBonus + adjustments },
               update: { creditBonus, total: solution + timing + creditBonus + adjustments, revision: { increment: 1 } },
             });
           }
           creditBonusAwardedAt = now;
-          await tx.auditLog.create({ data: { eventId: event.id, actorId: req.auth!.id, action: "score.credit_bonus_awarded", targetType: "Event", targetId: event.id, details: { rate, rounding, teams: teams.map((team) => ({ teamId: team.id, remainingCredits: team.credits, bonus: calculateCreditBonus(team.credits, team.reservedCredits, rate, rounding) })) } } });
+          creditBonusSummary = { teamCount: bonuses.length, totalBonus: bonuses.reduce((sum, entry) => sum + entry.bonus, 0) };
+          await tx.auditLog.create({ data: { eventId: event.id, actorId: req.auth!.id, action: "score.credit_bonus_awarded", targetType: "Event", targetId: event.id, details: { rate, rounding, teams: bonuses } } });
         }
         let pausedAt = event.pausedAt;
         if (input.data.status === "READY") {
@@ -897,11 +912,15 @@ export function createAdminRouter(prisma: PrismaClient, io: Server, codingCollab
         const data = { ...input.data, ...(input.data.status === "PAUSED" ? { codingRoundOpen: false } : {}), pausedAt, creditBonusAwardedAt, publicRevision: { increment: 1 } };
         const value = await tx.event.update({ where: { id: event.id }, data });
         await tx.auditLog.create({ data: { eventId: event.id, actorId: req.auth!.id, action: "event.settings_updated", targetType: "Event", targetId: event.id, details: input.data } });
-        return value;
+        return { event: value, creditBonusSummary };
       });
-      io.to("event:admin").emit("event.updated", { eventId: event.id, revision: updated.publicRevision });
-      io.to("event:teams").emit("event.updated", { eventId: event.id, revision: updated.publicRevision });
-      res.json({ event: updated });
+      io.to("event:admin").emit("event.updated", { eventId: event.id, revision: updated.event.publicRevision });
+      io.to("event:teams").emit("event.updated", { eventId: event.id, revision: updated.event.publicRevision });
+      // Opening the round changes scoreboard bonus points. Refresh live
+      // leaderboards at the same time as the event status.
+      io.to("event:admin").emit("leaderboard.updated", { revision: updated.event.publicRevision });
+      io.to("event:teams").emit("leaderboard.updated", { revision: updated.event.publicRevision });
+      res.json({ event: updated.event, ...(updated.creditBonusSummary ? { creditBonusAwarded: true, ...updated.creditBonusSummary } : {}) });
     } catch (error) { next(error); }
   });
 

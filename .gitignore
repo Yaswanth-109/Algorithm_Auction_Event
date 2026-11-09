@@ -6,6 +6,7 @@ dist/
 !.env.example
 credentials.seed.json
 Algorithm_Auction_Credentials*.xlsx
+Algorithm_Auction_Team_Credentials.xlsx
 *.xlsx.inspect.ndjson
 coverage/
 

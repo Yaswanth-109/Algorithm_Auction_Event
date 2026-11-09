@@ -248,7 +248,27 @@ export function createTeamRouter(prisma: PrismaClient, io: Server) {
       if (!session) return res.status(404).json({ error: "Coding session not found" });
       const serverNow = Date.now();
       const remainingSeconds = Math.max(0, Math.ceil((session.deadlineAt.getTime() - serverNow) / 1000));
-      res.json({ serverNow, session: { id: session.id, startedAt: session.startedAt, deadlineAt: session.deadlineAt, remainingSeconds, endedAt: session.endedAt, savedCode: session.savedCode, language: session.language, revision: session.revision }, problem: session.problem });
+      const hasSubmitted = await prisma.submission.count({ where: { teamId: id, problemId: session.problemId, kind: "SUBMIT" } }) > 0;
+      res.json({ serverNow, session: { id: session.id, startedAt: session.startedAt, deadlineAt: session.deadlineAt, remainingSeconds, endedAt: session.endedAt, savedCode: session.savedCode, language: session.language, revision: session.revision, hasSubmitted }, problem: session.problem });
+    } catch (error) { next(error); }
+  });
+
+  router.post("/coding/:sessionId/expire", async (req, res, next) => {
+    try {
+      const id = teamId(req);
+      if (!id) return res.status(403).json({ error: "Team account required" });
+      const session = await prisma.codingSession.findFirst({ where: { id: req.params.sessionId, teamId: id }, select: { id: true, problemId: true, deadlineAt: true, endedAt: true } });
+      if (!session) return res.status(404).json({ error: "Coding session not found" });
+      const now = new Date();
+      if (session.deadlineAt > now) return res.status(409).json({ error: "The coding session is still active" });
+      if (!session.endedAt) {
+        await prisma.$transaction([
+          prisma.codingSession.updateMany({ where: { id: session.id, endedAt: null, deadlineAt: { lte: now } }, data: { endedAt: now } }),
+          prisma.teamProblem.updateMany({ where: { teamId: id, problemId: session.problemId, status: "IN_PROGRESS" }, data: { status: "TIME_EXPIRED" } }),
+        ]);
+        emitTeam(id, Date.now());
+      }
+      res.json({ expired: true });
     } catch (error) { next(error); }
   });
 
